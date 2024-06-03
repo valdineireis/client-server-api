@@ -3,15 +3,22 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"time"
 
+	"database/sql"
+
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/valyala/fastjson"
 )
 
-var endpointCotacaoDolar string = "http://economia.awesomeapi.com.br/json/last/USD-BRL"
+var (
+	endpointCotacaoDolar string = "http://economia.awesomeapi.com.br/json/last/USD-BRL"
+	globalDB             *sql.DB
+)
 
 type CotacaoDolar struct {
 	Code       string `json:"code"`
@@ -27,7 +34,20 @@ type CotacaoDolar struct {
 	CreateDate string `json:"create_date"`
 }
 
+func (c CotacaoDolar) String() string {
+	data, err := json.Marshal(c)
+	if err != nil {
+		log.Println("Erro ao converter contação para string.", c)
+		return ""
+	}
+	return string(data)
+}
+
 func main() {
+	initDB()
+	defer globalDB.Close()
+	createTableCotacao()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", HomeHandler)
 	mux.HandleFunc("/cotacao", CotacaoHandler)
@@ -41,23 +61,42 @@ func HomeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func CotacaoHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	cotacao, err := RealizaCotacao(ctx)
+	cotacao, err := contacaoService()
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		serverError(w, err)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
+	serverSuccess(w)
 	json.NewEncoder(w).Encode(cotacao)
 }
 
-func RealizaCotacao(ctx context.Context) (*CotacaoDolar, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", endpointCotacaoDolar, nil)
+func serverError(w http.ResponseWriter, err error) {
+	log.Printf("ERROR: %s", err.Error())
+	http.Error(w, "Sorry, something went wrong", http.StatusInternalServerError)
+}
+
+func serverSuccess(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+}
+
+func contacaoService() (*CotacaoDolar, error) {
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer reqCancel()
+	cotacao, err := RealizaCotacao(reqCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer dbCancel()
+	persist(dbCtx, cotacao.String())
+
+	return cotacao, err
+}
+
+func RealizaCotacao(reqCtx context.Context) (*CotacaoDolar, error) {
+	req, err := http.NewRequestWithContext(reqCtx, "GET", endpointCotacaoDolar, nil)
 	if err != nil {
 		log.Fatalf("Erro ao criar requisição para o endpoint: %s. Erro: %s\n", endpointCotacaoDolar, err)
 		return nil, err
@@ -92,11 +131,46 @@ func CotacaoResponseParser(body []byte, cotacao *CotacaoDolar) error {
 	if err != nil {
 		return err
 	}
-	cotacaoJSON := value.Get("USDBRL").String()
+	cotacaoString := value.Get("USDBRL").String()
 
-	if err := json.Unmarshal([]byte(cotacaoJSON), &cotacao); err != nil {
+	if err := json.Unmarshal([]byte(cotacaoString), &cotacao); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func initDB() {
+	fmt.Println("Init DB ...")
+	var err error
+	globalDB, err = sql.Open("sqlite3", "./cotacao.db")
+	if globalDB == nil || err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Testing db connection ...")
+	if err = globalDB.Ping(); err != nil {
+		log.Fatal("Error on opening database connection: %s", err.Error())
+	}
+}
+
+func createTableCotacao() {
+	_, err := globalDB.Exec(`CREATE TABLE IF NOT EXISTS cotacao (tag jsonb)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func persist(ctx context.Context, data string) {
+	stmt, err := globalDB.Prepare("insert into cotacao(tag) values(?)")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stmt.Close()
+
+	_, err = stmt.ExecContext(ctx, data)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("Database storage complete!")
 }
