@@ -67,7 +67,7 @@ func CotacaoHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serverSuccess(w)
-	json.NewEncoder(w).Encode(cotacao)
+	json.NewEncoder(w).Encode(cotacao.Bid)
 }
 
 func serverError(w http.ResponseWriter, err error) {
